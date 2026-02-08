@@ -65,6 +65,12 @@ class MaraffaEnv:
 
     Phase 1: declarer chooses trump (action in [0..3]).
     Phase 2: normal play (action is card id in [0..39]).
+
+    Notes on determinism / testing:
+    - `reset(seed=...)` samples a new shuffled deal and a random declarer.
+    - For paired testing (fishtest-style), use `deal_from_seed()` +
+      `reset_from(hands, declarer)` to replay the exact same deal and/or a
+      rotated deal.
     """
 
     def __init__(self, seed: int | None = None):
@@ -88,6 +94,43 @@ class MaraffaEnv:
         self.played_mask = 0
         self.trick_history: List[Tuple[int, Tuple[int, int, int, int], Tuple[int, int, int, int]]] = []
         self.done = False
+
+    @staticmethod
+    def deal_from_seed(seed: int) -> tuple[list[int], int]:
+        """Return (hands, declarer) sampled deterministically from seed.
+
+        hands is a length-4 list of bitmasks.
+        """
+        rng = random.Random(int(seed))
+        deck = list(range(NUM_CARDS))
+        rng.shuffle(deck)
+        hands = [0, 0, 0, 0]
+        for i, c in enumerate(deck):
+            hands[i & 3] |= 1 << c
+        declarer = rng.randrange(NUM_PLAYERS)
+        return hands, int(declarer)
+
+    def reset_from(self, hands: list[int], declarer: int) -> Dict[str, object]:
+        """Reset environment to a specific deal (hands + declarer)."""
+        self.hands = [int(h) for h in hands]
+
+        self.declarer = int(declarer)
+        self.current_player = int(declarer)
+        self.choose_trump_phase = True
+        self.trump_suit = -1
+
+        self.trick_cards = [-1, -1, -1, -1]
+        self.trick_players = [-1, -1, -1, -1]
+        self.trick_len = 0
+        self.lead_suit = -1
+        self.trick_index = 0
+
+        self.scores_thirds = [0, 0]
+        self.bonus_team = -1
+        self.played_mask = 0
+        self.trick_history = []
+        self.done = False
+        return self.obs()
 
     def reset(self, seed: int | None = None) -> Dict[str, object]:
         if seed is not None:
