@@ -45,59 +45,54 @@ def _void_suits_from_history(obs: dict) -> list[list[bool]]:
     return void
 
 
-def _determinize_env(obs: dict, rng: random.Random, max_tries: int = 200) -> MaraffaEnv:
-    """Create a fully-specified env consistent with the (masked) observation.
+def _deal_hidden_hands_with_voids(
+    remaining_cards: list[int],
+    fixed_hands: dict[int, int],
+    needs: list[int],
+    void: list[list[bool]],
+    rng: random.Random,
+    max_tries: int = 200,
+) -> list[int] | None:
+    """Assign remaining_cards to non-fixed players respecting void suits.
 
-    We only know our own hand; we sample the unknown hands uniformly from the
-    remaining cards, respecting each player's remaining hand size.
+    fixed_hands contains already-known hands (e.g. both teammates). Those cards
+    must not appear in the dealt hidden hands.
 
-    We also enforce a lightweight public-information constraint: if a player
-    failed to follow suit in the public history, we do not give them any cards
-    of that suit in their current (unplayed) hand.
+    This avoids heavy rejection by dealing only from allowed card pools.
     """
+    fixed_hands = {int(p): int(h) for p, h in fixed_hands.items()}
 
-    me = int(obs["player"])
-    my_hand = int(obs["hand_mask"])
-    played_mask = int(obs["played_mask"])
-    void = _void_suits_from_history(obs)
+    # Pre-split cards by suit for faster allowed checks.
+    by_suit = [[], [], [], []]
+    for c in remaining_cards:
+        by_suit[CARD_SUIT[c]].append(c)
 
-    # Cards that are already known to be not in any hand.
-    unavailable = my_hand | played_mask
-    remaining_cards_all = [c for c in range(NUM_CARDS) if ((unavailable >> c) & 1) == 0]
-
-    for _attempt in range(max_tries):
-        remaining_cards = remaining_cards_all[:]
-        rng.shuffle(remaining_cards)
+    for _ in range(max_tries):
+        # Fresh mutable pools.
+        pools = [lst[:] for lst in by_suit]
+        for s in range(4):
+            rng.shuffle(pools[s])
 
         hands = [0, 0, 0, 0]
-        hands[me] = my_hand
+        for p, h in fixed_hands.items():
+            hands[p] = h
 
-        idx = 0
+        # Deal to players with the tightest constraints first.
+        players = [p for p in range(4) if p not in fixed_hands]
+        players.sort(key=lambda p: sum(len(pools[s]) for s in range(4) if not void[p][s]))
+
         ok = True
-        for p in range(4):
-            if p == me:
-                continue
-            need = _remaining_hand_size(obs, p)
+        for p in players:
+            need = int(needs[p])
             m = 0
-            for _ in range(need):
-                if idx >= len(remaining_cards):
+            for _k in range(need):
+                allowed_suits = [s for s in range(4) if (not void[p][s]) and pools[s]]
+                if not allowed_suits:
                     ok = False
                     break
-                c = remaining_cards[idx]
-                idx += 1
+                s = max(allowed_suits, key=lambda ss: len(pools[ss]))
+                c = pools[s].pop()
                 m |= 1 << c
-            if not ok:
-                break
-            # Enforce void suit constraints on the CURRENT hand.
-            for s in range(4):
-                if void[p][s]:
-                    # if any card in suit s is present, reject.
-                    # suit cards are contiguous blocks of 10.
-                    base = s * 10
-                    suit_mask = ((1 << 10) - 1) << base
-                    if m & suit_mask:
-                        ok = False
-                        break
             if not ok:
                 break
             hands[p] = m
@@ -105,45 +100,76 @@ def _determinize_env(obs: dict, rng: random.Random, max_tries: int = 200) -> Mar
         if not ok:
             continue
 
-        env = MaraffaEnv(seed=0)
-        env.hands = hands
-        env.current_player = int(obs["current_player"])
-        env.declarer = int(obs["declarer"])
-        env.choose_trump_phase = bool(obs["choose_trump_phase"])
-        env.trump_suit = int(obs["trump_suit"])
-
-        tc = list(obs["trick_cards"])
-        tp = list(obs["trick_players"])
-        env.trick_cards = [int(x) for x in tc]
-        env.trick_players = [int(x) for x in tp]
-        env.trick_len = int(obs["trick_len"])
-        env.lead_suit = int(obs["lead_suit"])
-        env.trick_index = int(obs["trick_index"])
-
-        st = list(obs["scores_thirds"])
-        env.scores_thirds = [int(st[0]), int(st[1])]
-        env.bonus_team = int(obs["bonus_team"])
-        env.played_mask = int(obs["played_mask"])
-        env.trick_history = obs.get("trick_history", [])[:]
-        env.done = bool(obs["done"])
-
-        return env
-
-    # Fallback: if constraints are too tight, ignore them.
-    rng.shuffle(remaining_cards_all)
-    hands = [0, 0, 0, 0]
-    hands[me] = my_hand
-    idx = 0
-    for p in range(4):
-        if p == me:
+        # Sanity: total cards assigned equals expected.
+        tot = 0
+        for p in range(4):
+            tot += hands[p].bit_count()
+        expected = len(remaining_cards) + sum(h.bit_count() for h in fixed_hands.values())
+        if tot != expected:
             continue
-        need = _remaining_hand_size(obs, p)
-        m = 0
-        for _ in range(need):
-            c = remaining_cards_all[idx]
-            idx += 1
-            m |= 1 << c
-        hands[p] = m
+
+        return hands
+
+    return None
+
+
+def _determinize_env(
+    obs: dict,
+    rng: random.Random,
+    max_tries: int = 200,
+    known_hands: dict[int, int] | None = None,
+) -> MaraffaEnv:
+    """Create a fully-specified env consistent with the (masked) observation."""
+
+    me = int(obs["player"])
+    my_hand = int(obs["hand_mask"])
+    played_mask = int(obs["played_mask"])
+    void = _void_suits_from_history(obs)
+
+    known_hands = dict(known_hands or {})
+    known_hands[me] = my_hand
+
+    # Cards that are already known to be not in any hand.
+    unavailable = played_mask
+    for h in known_hands.values():
+        unavailable |= int(h)
+
+    remaining_cards_all = [c for c in range(NUM_CARDS) if ((unavailable >> c) & 1) == 0]
+
+    needs = [0, 0, 0, 0]
+    for p in range(4):
+        if p in known_hands:
+            # Sanity: should match expected remaining size.
+            continue
+        needs[p] = _remaining_hand_size(obs, p)
+
+    hands = _deal_hidden_hands_with_voids(
+        remaining_cards_all,
+        fixed_hands=known_hands,
+        needs=needs,
+        void=void,
+        rng=rng,
+        max_tries=max_tries,
+    )
+
+    if hands is None:
+        # Fallback: ignore void constraints.
+        remaining_cards = remaining_cards_all[:]
+        rng.shuffle(remaining_cards)
+        hands = [0, 0, 0, 0]
+        for p, h in known_hands.items():
+            hands[int(p)] = int(h)
+        idx = 0
+        for p in range(4):
+            if p in known_hands:
+                continue
+            need = needs[p]
+            m = 0
+            for _ in range(need):
+                c = remaining_cards[idx]
+                idx += 1
+                m |= 1 << c
+            hands[p] = m
 
     env = MaraffaEnv(seed=0)
     env.hands = hands
@@ -151,17 +177,22 @@ def _determinize_env(obs: dict, rng: random.Random, max_tries: int = 200) -> Mar
     env.declarer = int(obs["declarer"])
     env.choose_trump_phase = bool(obs["choose_trump_phase"])
     env.trump_suit = int(obs["trump_suit"])
-    env.trick_cards = [int(x) for x in list(obs["trick_cards"])]
-    env.trick_players = [int(x) for x in list(obs["trick_players"])]
+
+    tc = list(obs["trick_cards"])
+    tp = list(obs["trick_players"])
+    env.trick_cards = [int(x) for x in tc]
+    env.trick_players = [int(x) for x in tp]
     env.trick_len = int(obs["trick_len"])
     env.lead_suit = int(obs["lead_suit"])
     env.trick_index = int(obs["trick_index"])
+
     st = list(obs["scores_thirds"])
     env.scores_thirds = [int(st[0]), int(st[1])]
     env.bonus_team = int(obs["bonus_team"])
     env.played_mask = int(obs["played_mask"])
     env.trick_history = obs.get("trick_history", [])[:]
     env.done = bool(obs["done"])
+
     return env
 
 
@@ -175,6 +206,10 @@ def _rollout_to_end(env: MaraffaEnv, policies: list[object]) -> float:
         pol = policies[p]
         legal = env.legal_actions(p)
         obs = env.obs(player=p)
+        if not legal:
+            # Shouldn't happen, but keep rollouts robust against inconsistent determinization.
+            env.done = True
+            break
         if env.choose_trump_phase:
             act = pol.choose_trump(obs, legal)
         else:
@@ -185,41 +220,71 @@ def _rollout_to_end(env: MaraffaEnv, policies: list[object]) -> float:
 
 @dataclass
 class HeroAgent:
-    """Non-cheating hero agent (imperfect information).
+    """Quality-first hero for imperfect information.
 
-    Uses determinization (sampling unknown hands) + rollouts with heuristic_v0.
+    Key upgrade vs naive sampling: this object controls BOTH players on the team
+    (e.g. players 0&2 for agent_even), so it can remember both teammates' hands
+    once each has been observed on their turn. This is team-level information
+    sharing (not opponent hand cheating).
 
-    This is a basic ISMCTS-style approach: for each candidate action, sample N
-    consistent hidden states, apply the action, then rollout to end.
+    Then we determinize only the opponents' hidden cards and evaluate actions by
+    rollouts.
+
+    Note: evaluation is always from team parity 0's perspective (players 0&2).
+    When used as agent_odd, set team_parity=1.
     """
 
-    name: str = "hero_v2_determinization"
-    samples_per_action: int = 12
+    name: str = "hero_v4_team_share_mc"
+    team_parity: int = 0
+
+    # Budgets (quality-first but bounded)
+    trump_samples: int = 18
+    samples_per_action: int = 24
 
     def __post_init__(self):
         self._h = HeuristicAgent()
+        # Remember teammate hands within the current deal.
+        self._known_team_hands: dict[int, int] = {}
+
+    def _team_sign(self) -> float:
+        return 1.0 if int(self.team_parity) == 0 else -1.0
+
+    def _maybe_reset_memory(self, obs: dict) -> None:
+        # New deal heuristic: at the very start.
+        if int(obs["trick_index"]) == 0 and int(obs["trick_len"]) == 0 and int(obs["played_mask"]) == 0 and bool(obs["choose_trump_phase"]):
+            self._known_team_hands = {}
+
+    def _remember_hand(self, obs: dict) -> None:
+        p = int(obs["player"])
+        if (p & 1) == int(self.team_parity):
+            self._known_team_hands[p] = int(obs["hand_mask"])
 
     def choose_trump(self, obs: dict, legal: list[int]) -> int:
-        # Evaluate each trump suit by sampling.
-        rng = random.Random((int(obs["played_mask"]) ^ (int(obs["hand_mask"]) << 1) ^ 0xC0FFEE) & 0xFFFFFFFF)
+        self._maybe_reset_memory(obs)
+        self._remember_hand(obs)
+
+        rng = random.Random((int(obs["hand_mask"]) ^ 0xC0FFEE) & 0xFFFFFFFF)
         best_a = int(legal[0])
         best_v = -1e18
 
         for a in legal:
             acc = 0.0
-            for _ in range(self.samples_per_action):
-                env = _determinize_env(obs, rng)
+            for _ in range(int(self.trump_samples)):
+                env = _determinize_env(obs, rng, known_hands=self._known_team_hands)
                 env.step(int(a))
-                # Everyone uses heuristic during rollout (including us after first move).
+                # Rollout with heuristic for everyone (avoid recursive sampling inside rollouts).
                 policies = [self._h, self._h, self._h, self._h]
                 acc += _rollout_to_end(env, policies)
-            v = acc / float(self.samples_per_action)
+            v = self._team_sign() * (acc / float(self.trump_samples))
             if v > best_v:
                 best_v = v
                 best_a = int(a)
         return int(best_a)
 
     def play_card(self, obs: dict, legal: list[int]) -> int:
+        self._maybe_reset_memory(obs)
+        self._remember_hand(obs)
+
         if len(legal) == 1:
             return int(legal[0])
 
@@ -227,16 +292,17 @@ class HeroAgent:
         best_a = int(legal[0])
         best_v = -1e18
 
-        # To keep it fast, sample a fixed number per action.
         for a in legal:
             acc = 0.0
-            for _ in range(self.samples_per_action):
-                env = _determinize_env(obs, rng)
+            for _ in range(int(self.samples_per_action)):
+                env = _determinize_env(obs, rng, known_hands=self._known_team_hands)
                 env.step(int(a))
+                # Rollout with heuristic for everyone (avoid recursive sampling inside rollouts).
                 policies = [self._h, self._h, self._h, self._h]
                 acc += _rollout_to_end(env, policies)
-            v = acc / float(self.samples_per_action)
+            v = self._team_sign() * (acc / float(self.samples_per_action))
             if v > best_v:
                 best_v = v
                 best_a = int(a)
+
         return int(best_a)
