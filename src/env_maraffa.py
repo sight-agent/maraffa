@@ -140,6 +140,7 @@ class MaraffaEnv:
             "scores_thirds": tuple(int(x) for x in self.scores_thirds),
             "bonus_team": int(self.bonus_team),
             "played_mask": int(self.played_mask),
+            "trick_history": self.trick_history[:],  # public (cards already played)
             "done": bool(self.done),
         }
         if player is None:
