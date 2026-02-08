@@ -117,9 +117,17 @@ class MaraffaEnv:
         self.done = False
         return self.obs()
 
-    def obs(self) -> Dict[str, object]:
-        return {
-            "hands": self.hands[:],
+    def obs(self, player: int | None = None) -> Dict[str, object]:
+        """Return a player-centric observation.
+
+        If player is provided, the observation includes ONLY that player's hand
+        (hand_mask) and omits other players' private information.
+
+        Note: this env is still perfect-information internally, but we enforce
+        fairness by never passing the env object itself to agents.
+        """
+
+        base = {
             "current_player": int(self.current_player),
             "declarer": int(self.declarer),
             "choose_trump_phase": bool(self.choose_trump_phase),
@@ -134,6 +142,14 @@ class MaraffaEnv:
             "played_mask": int(self.played_mask),
             "done": bool(self.done),
         }
+        if player is None:
+            # Internal/debug only (not for agents).
+            base["hands"] = self.hands[:]
+            return base
+
+        base["player"] = int(player)
+        base["hand_mask"] = int(self.hands[player])
+        return base
 
     def legal_actions(self, player: int) -> List[int]:
         if self.choose_trump_phase:

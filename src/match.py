@@ -14,11 +14,11 @@ class RandomAgent:
     def __init__(self, seed: int = 0):
         self.rng = random.Random(seed)
 
-    def choose_trump(self, env: MaraffaEnv, player: int) -> int:
-        return self.rng.randrange(4)
+    def choose_trump(self, obs: dict, legal: list[int]) -> int:
+        return int(self.rng.choice(legal))
 
-    def play_card(self, env: MaraffaEnv, player: int, legal: list[int]) -> int:
-        return self.rng.choice(legal)
+    def play_card(self, obs: dict, legal: list[int]) -> int:
+        return int(self.rng.choice(legal))
 
 
 def play_hand(env: MaraffaEnv, agent_even, agent_odd, seed: int) -> tuple[float, float]:
@@ -27,10 +27,11 @@ def play_hand(env: MaraffaEnv, agent_even, agent_odd, seed: int) -> tuple[float,
         p = env.current_player
         policy = agent_even if (p & 1) == 0 else agent_odd
         legal = env.legal_actions(p)
+        obs = env.obs(player=p)
         if env.choose_trump_phase:
-            act = policy.choose_trump(env, p)
+            act = policy.choose_trump(obs, legal)
         else:
-            act = policy.play_card(env, p, legal)
+            act = policy.play_card(obs, legal)
         env.step(act)
     # Convert thirds to points for reporting
     return env.scores_thirds[0] / 3.0, env.scores_thirds[1] / 3.0

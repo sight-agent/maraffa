@@ -8,7 +8,6 @@ from .env_maraffa import (
     CARD_STRENGTH,
     CARD_SUIT,
     SUIT_MASKS,
-    MaraffaEnv,
     team_of,
 )
 
@@ -43,54 +42,65 @@ PARAMS: tuple[float, ...] = (
 )
 
 
-def _current_winning_team(env: MaraffaEnv) -> int:
-    if env.trick_len == 0:
+def _current_winning_team(obs: dict) -> int:
+    trick_len = int(obs["trick_len"])
+    if trick_len == 0:
         return -1
-    has_trump = False
-    for i in range(env.trick_len):
-        c = env.trick_cards[i]
-        if CARD_SUIT[c] == env.trump_suit:
-            has_trump = True
-            break
+    trump_suit = int(obs["trump_suit"])
+    lead_suit = int(obs["lead_suit"])
+    trick_cards = list(obs["trick_cards"])
+    trick_players = list(obs["trick_players"])
+
+    has_trump = any(CARD_SUIT[trick_cards[i]] == trump_suit for i in range(trick_len))
+
     best_i = 0
     best_s = -1
-    for i in range(env.trick_len):
-        c = env.trick_cards[i]
+    for i in range(trick_len):
+        c = trick_cards[i]
         suit = CARD_SUIT[c]
         if has_trump:
-            if suit != env.trump_suit:
+            if suit != trump_suit:
                 continue
         else:
-            if suit != env.lead_suit:
+            if suit != lead_suit:
                 continue
         st = CARD_STRENGTH[c]
         if st > best_s:
             best_s = st
             best_i = i
-    return team_of(env.trick_players[best_i])
+    return team_of(int(trick_players[best_i]))
 
 
-def _wins_if_played(env: MaraffaEnv, player: int, card: int) -> bool:
-    if env.trick_len == 0:
+def _wins_if_played(obs: dict, player: int, card: int) -> bool:
+    trick_len = int(obs["trick_len"])
+    if trick_len == 0:
         return False
-    cards = env.trick_cards[: env.trick_len] + [card]
-    players = env.trick_players[: env.trick_len] + [player]
-    has_trump = any(CARD_SUIT[c] == env.trump_suit for c in cards)
+
+    trump_suit = int(obs["trump_suit"])
+    lead_suit = int(obs["lead_suit"])
+    trick_cards = list(obs["trick_cards"])
+    trick_players = list(obs["trick_players"])
+
+    cards = trick_cards[:trick_len] + [card]
+    players = trick_players[:trick_len] + [player]
+
+    has_trump = any(CARD_SUIT[c] == trump_suit for c in cards)
+
     best_i = 0
     best_s = -1
     for i, c in enumerate(cards):
         suit = CARD_SUIT[c]
         if has_trump:
-            if suit != env.trump_suit:
+            if suit != trump_suit:
                 continue
         else:
-            if suit != env.lead_suit:
+            if suit != lead_suit:
                 continue
         st = CARD_STRENGTH[c]
         if st > best_s:
             best_s = st
             best_i = i
-    return players[best_i] == player
+    return int(players[best_i]) == int(player)
 
 
 @dataclass
@@ -98,12 +108,13 @@ class Agent:
     name: str = "heuristic_v0"
     params: tuple[float, ...] = PARAMS
 
-    def choose_trump(self, env: MaraffaEnv, player: int) -> int:
-        hand = env.hands[player]
+    def choose_trump(self, obs: dict, legal: List[int]) -> int:
+        # legal is expected to be [0,1,2,3]
+        hand = int(obs["hand_mask"])
         p = self.params
-        best_s = 0
+        best_s = int(legal[0])
         best_v = -1e18
-        for s in range(4):
+        for s in legal:
             m = hand & SUIT_MASKS[s]
             cnt = m.bit_count()
             pts = 0.0
@@ -125,18 +136,23 @@ class Agent:
                 best_s = s
         return int(best_s)
 
-    def play_card(self, env: MaraffaEnv, player: int, legal: List[int]) -> int:
+    def play_card(self, obs: dict, legal: List[int]) -> int:
         if len(legal) == 1:
-            return legal[0]
+            return int(legal[0])
         p = self.params
 
-        if env.trick_len == 0:
-            endg = 1.0 if env.trick_index >= 7 else 0.0
-            best = legal[0]
+        player = int(obs["player"])
+        trump_suit = int(obs["trump_suit"])
+        trick_len = int(obs["trick_len"])
+        trick_index = int(obs["trick_index"])
+        hand = int(obs["hand_mask"])
+
+        if trick_len == 0:
+            endg = 1.0 if trick_index >= 7 else 0.0
+            best = int(legal[0])
             best_sc = -1e18
-            hand = env.hands[player]
             for c in legal:
-                tr = 1.0 if CARD_SUIT[c] == env.trump_suit else 0.0
+                tr = 1.0 if CARD_SUIT[c] == trump_suit else 0.0
                 sc = p[6] * (CARD_POINTS_THIRDS[c] / 3.0) + p[7] * (CARD_STRENGTH[c] / 9.0) - p[8] * tr + p[9] * tr * endg
                 suit_cnt = (hand & SUIT_MASKS[CARD_SUIT[c]]).bit_count()
                 sc += p[10] * (suit_cnt / 10.0)
@@ -146,16 +162,18 @@ class Agent:
             return int(best)
 
         team = team_of(player)
-        partner_winning = _current_winning_team(env) == team
+        partner_winning = _current_winning_team(obs) == team
+
         points_on_table = 0.0
-        for i in range(env.trick_len):
-            c = env.trick_cards[i]
+        trick_cards = list(obs["trick_cards"])
+        for i in range(trick_len):
+            c = trick_cards[i]
             if c >= 0:
                 points_on_table += CARD_POINTS_THIRDS[c] / 3.0
 
-        winners = [c for c in legal if _wins_if_played(env, player, c)]
+        winners = [c for c in legal if _wins_if_played(obs, player, c)]
         if partner_winning:
-            if winners and (points_on_table >= p[11] or env.trick_index >= p[12]):
+            if winners and (points_on_table >= p[11] or trick_index >= p[12]):
                 return int(
                     min(
                         winners,
@@ -165,7 +183,7 @@ class Agent:
             return int(
                 min(
                     legal,
-                    key=lambda c: (p[16] * CARD_POINTS_THIRDS[c] + p[17] * CARD_STRENGTH[c] + p[18] * (1 if CARD_SUIT[c] == env.trump_suit else 0)),
+                    key=lambda c: (p[16] * CARD_POINTS_THIRDS[c] + p[17] * CARD_STRENGTH[c] + p[18] * (1 if CARD_SUIT[c] == trump_suit else 0)),
                 )
             )
 
@@ -176,7 +194,7 @@ class Agent:
                     key=lambda c: (
                         p[19] * CARD_POINTS_THIRDS[c]
                         + p[20] * CARD_STRENGTH[c]
-                        + p[21] * (1 if CARD_SUIT[c] == env.trump_suit else 0)
+                        + p[21] * (1 if CARD_SUIT[c] == trump_suit else 0)
                         - p[22] * points_on_table
                     ),
                 )
@@ -184,7 +202,7 @@ class Agent:
         return int(
             min(
                 legal,
-                key=lambda c: (p[23] * CARD_POINTS_THIRDS[c] + p[24] * CARD_STRENGTH[c] + p[25] * (1 if CARD_SUIT[c] == env.trump_suit else 0)),
+                key=lambda c: (p[23] * CARD_POINTS_THIRDS[c] + p[24] * CARD_STRENGTH[c] + p[25] * (1 if CARD_SUIT[c] == trump_suit else 0)),
             )
         )
 
