@@ -26,7 +26,7 @@ def _current_winner_team(obs: dict) -> int:
     best_i = 0
     best_s = -1
     for i in range(tl):
-        c = cards[i]
+        c = int(cards[i])
         suit = CARD_SUIT[c]
         if has_trump:
             if suit != trump:
@@ -50,8 +50,8 @@ def _wins_if_played(obs: dict, player: int, card: int) -> bool:
     cards = list(obs["trick_cards"])
     players = list(obs["trick_players"])
 
-    cards2 = cards[:tl] + [card]
-    players2 = players[:tl] + [player]
+    cards2 = [int(x) for x in cards[:tl]] + [int(card)]
+    players2 = [int(x) for x in players[:tl]] + [int(player)]
 
     has_trump = any(CARD_SUIT[c] == trump for c in cards2)
     best_i = 0
@@ -101,9 +101,17 @@ def _seen_cards_mask(obs: dict) -> int:
     """All publicly seen cards (played so far + current trick)."""
     m = int(obs["played_mask"])
     for c in list(obs["trick_cards"]):
-        if int(c) >= 0:
-            m |= 1 << int(c)
+        c = int(c)
+        if c >= 0:
+            m |= 1 << c
     return m
+
+
+def _suit_seen_count(obs: dict, suit: int) -> int:
+    seen = _seen_cards_mask(obs)
+    base = suit * 10
+    suit_mask = ((1 << 10) - 1) << base
+    return int(((seen & suit_mask) >> base).bit_count())
 
 
 def _high_cards_seen_fraction(obs: dict, suit: int) -> float:
@@ -114,34 +122,53 @@ def _high_cards_seen_fraction(obs: dict, suit: int) -> float:
     return sum(1 for c in top if (seen >> c) & 1) / 3.0
 
 
+def _void_risk_for_lead(obs: dict, suit: int) -> float:
+    """Risk that leading suit will be trump-cut by opponents.
+
+    Very simple model: count how many opponents are known void in the suit.
+    """
+    void = _public_void_suits(obs)
+    me = int(obs["player"])
+    opps = [(me + 1) & 3, (me + 3) & 3]
+    return float(sum(1 for o in opps if void[o][suit]))
+
+
 @dataclass
 class HeroAgent:
-    """heuristic_v1: heuristic-style agent (no search, no cheating).
+    """heuristic_v2: stronger heuristic policy (no search, no cheating).
 
-    Upgrades over heuristic_v0:
-    - Uses public trick_history to infer void suits.
-    - Uses public seen cards to estimate suit safety.
-    - Slightly better trump choice using void+safety signals.
+    Adds public-information features in a way that can be tuned automatically:
+    - void suits inference
+    - suit safety from seen cards
+    - lead risk model (void opponents => higher cut risk)
+    - optional trump-draw heuristic when opponents are likely to cut
+
+    NOTE: no teammate information sharing; the agent only uses its own hand + public history.
     """
 
-    name: str = "heuristic_v1"
+    name: str = "heuristic_v2"
 
-    # weights (tweakable)
+    # --- Trump choice weights
     w_cnt: float = 1.20
     w_pts: float = 0.25
     w_str: float = 1.30
     w_maraffa: float = 2.60
-
     w_void_bonus: float = 0.25
     w_seen_high: float = 0.30
 
-    # play weights
+    # --- Lead weights
     w_lead_pts: float = 1.10
     w_lead_str: float = 0.70
     w_lead_trump_penalty: float = 3.50
     w_lead_suit_len: float = 0.60
     w_lead_seen_high: float = 0.80
 
+    # new lead features
+    w_lead_void_risk: float = 1.20
+    w_lead_suit_seen: float = 0.25
+    w_lead_draw_trump: float = 1.00
+
+    # --- Follow weights
     w_follow_win_low: float = 1.0
     w_follow_win_take_pts: float = 1.3
     w_follow_dump_low: float = 1.0
@@ -171,13 +198,10 @@ class HeroAgent:
 
             has_maraffa = 1.0 if (hand & MARAFFA_MASKS[s]) == MARAFFA_MASKS[s] else 0.0
 
-            # public features
             void_bonus = 0.0
-            # if next opponents are void in suit, leading it later is safer
             for opp in ((me + 1) & 3, (me + 3) & 3):
                 if void[opp][s]:
                     void_bonus += 1.0
-            # if partner void, trumping later might be good, but also coordination is hard
             if void[partner][s]:
                 void_bonus += 0.25
 
@@ -205,10 +229,20 @@ class HeroAgent:
         trick_len = int(obs["trick_len"])
         trick_index = int(obs["trick_index"])
 
-        # Lead: prefer long safe suits; avoid wasting trump early; use seen-high as safety.
+        # --- Lead
         if trick_len == 0:
             hand = int(obs["hand_mask"])
             endg = 1.0 if trick_index >= 7 else 0.0
+
+            # If opponents are frequently void in many suits, consider drawing trump.
+            void = _public_void_suits(obs)
+            opps = [(me + 1) & 3, (me + 3) & 3]
+            opp_void_total = 0
+            for o in opps:
+                opp_void_total += sum(1 for s in range(4) if void[o][s])
+            have_trump = (hand & SUIT_MASKS[trump]) != 0
+
+            # Candidate scoring.
             best = int(legal[0])
             best_sc = -1e18
             for c in legal:
@@ -216,6 +250,8 @@ class HeroAgent:
                 tr = 1.0 if s == trump else 0.0
                 suit_cnt = (hand & SUIT_MASKS[s]).bit_count()
                 seen_high = _high_cards_seen_fraction(obs, s)
+                seen_cnt = _suit_seen_count(obs, s)
+                void_risk = _void_risk_for_lead(obs, s)
 
                 sc = 0.0
                 sc += self.w_lead_pts * (CARD_POINTS_THIRDS[c] / 3.0)
@@ -224,13 +260,21 @@ class HeroAgent:
                 sc += self.w_lead_suit_len * (suit_cnt / 10.0)
                 sc += self.w_lead_seen_high * seen_high
 
+                # Prefer suits that are "safer" and less likely to get cut.
+                sc -= self.w_lead_void_risk * void_risk * (1.0 - endg)
+                # If many cards of this suit already seen, it is slightly safer to lead it.
+                sc += self.w_lead_suit_seen * (seen_cnt / 10.0)
+
+                # Optional draw-trump impulse.
+                if have_trump and tr > 0.0:
+                    sc += self.w_lead_draw_trump * (opp_void_total / 8.0) * (1.0 - endg)
+
                 if sc > best_sc:
                     best_sc = sc
                     best = int(c)
             return int(best)
 
-        # Following: similar structure to heuristic_v0 but with a slightly more
-        # consistent points model.
+        # --- Following
         team = team_of(me)
         partner_winning = _current_winner_team(obs) == team
 
