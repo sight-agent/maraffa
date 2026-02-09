@@ -91,10 +91,11 @@ def propose(rng: random.Random, base: Dict[str, float], sigma: float) -> Dict[st
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--iters", type=int, default=200)
-    p.add_argument("--pop", type=int, default=24)
-    p.add_argument("--deals", type=int, default=200)
+    p.add_argument("--pop", type=int, default=12, help="Number of mutated candidates per iteration (plus the current best).")
+    p.add_argument("--deals", type=int, default=2000, help="Paired deals per evaluation (hands = deals*2).")
     p.add_argument("--seed", type=int, default=7000)
     p.add_argument("--sigma", type=float, default=0.25)
+    p.add_argument("--patience", type=int, default=30, help="Stop after this many iterations without improvement.")
     return p.parse_args()
 
 
@@ -106,24 +107,30 @@ def main() -> None:
 
     v0 = HeuristicV0()
 
-    # Separate train/val seeds
-    train_seed = int(args.seed) + 123
-    val_seed = int(args.seed) + 999
+    # Train/val are two different deal streams. To reduce overfitting to a fixed seed,
+    # we increment the seed at every iteration (but keep it identical across candidates
+    # within the same iteration for a fair comparison).
 
     best = dict(base)
-    best_train, _ = paired_winrate(HeroAgent(**best), v0, deals=args.deals, seed=train_seed)
-    best_val, _ = paired_winrate(HeroAgent(**best), v0, deals=max(50, args.deals // 2), seed=val_seed)
-
     sigma = float(args.sigma)
 
-    print(f"base train_wr={best_train:.4f} val_wr={best_val:.4f} sigma={sigma:.3f}")
+    # Initial baseline (iteration 0 seeds)
+    seed0_train = int(args.seed) + 123
+    seed0_val = int(args.seed) + 999
+    best_train, _ = paired_winrate(HeroAgent(**best), v0, deals=args.deals, seed=seed0_train)
+    best_val, _ = paired_winrate(HeroAgent(**best), v0, deals=args.deals, seed=seed0_val)
 
+    print(f"base train_wr={best_train:.4f} val_wr={best_val:.4f} sigma={sigma:.3f} deals={args.deals} pop={args.pop}")
+
+    stale = 0
     t0 = time.time()
     for it in range(int(args.iters)):
+        train_seed = int(args.seed) + 123 + it
+        val_seed = int(args.seed) + 999 + it
+
         # generate candidates
         cand_params = [propose(rng, best, sigma) for _ in range(int(args.pop))]
-        # include current best
-        cand_params.append(best)
+        cand_params.append(best)  # include current best
 
         scored = []
         for j, pmap in enumerate(cand_params):
@@ -138,7 +145,10 @@ def main() -> None:
         if improved:
             best = dict(top)
             best_train = float(top_wr)
-            best_val, _ = paired_winrate(HeroAgent(**best), v0, deals=max(50, args.deals // 2), seed=val_seed)
+            best_val, _ = paired_winrate(HeroAgent(**best), v0, deals=args.deals, seed=val_seed)
+            stale = 0
+        else:
+            stale += 1
 
         # anneal sigma gently
         if (it + 1) % 25 == 0:
@@ -148,11 +158,13 @@ def main() -> None:
             elapsed = time.time() - t0
             tag = "*" if improved else ""
             print(
-                f"it={it:03d} best_train={best_train:.4f} best_val={best_val:.4f} sigma={sigma:.3f} {tag} elapsed={elapsed:.1f}s"
+                f"it={it:03d} train_seed={train_seed} val_seed={val_seed} best_train={best_train:.4f} best_val={best_val:.4f} sigma={sigma:.3f} stale={stale} {tag} elapsed={elapsed:.1f}s"
             )
 
-        # Early stop if we clearly beat 0.70 on val
+        # Early stop conditions
         if best_val >= 0.70 and best_train >= 0.70:
+            break
+        if stale >= int(args.patience):
             break
 
     print("---")
