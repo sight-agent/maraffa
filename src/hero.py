@@ -166,12 +166,14 @@ def _max_trump_strength(hand_mask: int, trump_suit: int) -> int:
 
 @dataclass
 class HeroAgent:
-    """heuristic_v2_base: linear model over BASE features.
+    """heuristic_v3_interactions: linear model with BASE + INTERACTION features.
 
-    No interaction terms here. We'll add them in a later step.
+    Base features are the same as heuristic_v2_base.
+    Interaction features are explicit pairwise terms (products / gates) and can be
+    turned off by setting their weights to 0.
     """
 
-    name: str = "heuristic_v2_base"
+    name: str = "heuristic_v3_interactions"
 
     # --- Trump choice weights (base)
     w_cnt: float = 1.20
@@ -205,6 +207,20 @@ class HeroAgent:
     w_follow_pos_in_trick: float = 0.15
     w_follow_trump_count: float = 0.20
     w_follow_max_trump: float = 0.10
+
+    # --- INTERACTION weights (start at 0; tuning will find useful ones)
+    # lead interactions
+    wi_lead_voidrisk_x_not_endg: float = 0.0
+    wi_lead_trump_x_oppvoid: float = 0.0
+    wi_lead_nontrump_x_voidrisk: float = 0.0
+
+    # follow interactions
+    wi_take_x_points: float = 0.0
+    wi_dump_x_points: float = 0.0
+    wi_take_x_pos: float = 0.0
+    wi_dump_x_pos: float = 0.0
+    wi_take_x_trumpcount: float = 0.0
+    wi_dump_x_trumpcount: float = 0.0
 
     def choose_trump(self, obs: dict, legal: list[int]) -> int:
         hand = int(obs["hand_mask"])
@@ -300,6 +316,16 @@ class HeroAgent:
                 if tr > 0.0:
                     sc += self.w_lead_trump_count * (tr_cnt / 10.0)
 
+                # --- INTERACTIONS (lead)
+                # Penalize void risk strongly in midgame.
+                sc -= self.wi_lead_voidrisk_x_not_endg * void_risk * (1.0 - endg)
+                # If leading trump and opponents are void in many suits, draw trump is more valuable.
+                if tr > 0.0:
+                    sc += self.wi_lead_trump_x_oppvoid * (opp_void_total / 8.0) * (1.0 - endg)
+                else:
+                    # Non-trump lead gets worse when void risk is high.
+                    sc -= self.wi_lead_nontrump_x_voidrisk * void_risk * (1.0 - endg)
+
                 if sc > best_sc:
                     best_sc = sc
                     best = int(c)
@@ -324,6 +350,10 @@ class HeroAgent:
                             self.w_follow_win_take_pts * CARD_POINTS_THIRDS[c]
                             + self.w_follow_win_low * CARD_STRENGTH[c]
                             - 0.8 * pts_table
+                            # INTERACTIONS (taking)
+                            - self.wi_take_x_points * pts_table
+                            - self.wi_take_x_pos * pos_in_trick
+                            - self.wi_take_x_trumpcount * (tr_cnt / 10.0)
                         ),
                     )
                 )
@@ -338,6 +368,10 @@ class HeroAgent:
                         + self.w_follow_pos_in_trick * pos_in_trick
                         + self.w_follow_trump_count * (tr_cnt / 10.0)
                         + self.w_follow_max_trump * (mx_tr / 9.0 if mx_tr >= 0 else 0.0)
+                        # INTERACTIONS (dumping)
+                        + self.wi_dump_x_points * pts_table
+                        + self.wi_dump_x_pos * pos_in_trick
+                        + self.wi_dump_x_trumpcount * (tr_cnt / 10.0)
                     ),
                 )
             )
@@ -352,6 +386,10 @@ class HeroAgent:
                         + 1.1 * (1 if CARD_SUIT[c] == trump else 0)
                         - 1.0 * pts_table
                         - 0.2 * pos_in_trick
+                        # INTERACTIONS (taking)
+                        - self.wi_take_x_points * pts_table
+                        - self.wi_take_x_pos * pos_in_trick
+                        - self.wi_take_x_trumpcount * (tr_cnt / 10.0)
                     ),
                 )
             )
@@ -367,6 +405,10 @@ class HeroAgent:
                     + self.w_follow_pos_in_trick * pos_in_trick
                     + self.w_follow_trump_count * (tr_cnt / 10.0)
                     + self.w_follow_max_trump * (mx_tr / 9.0 if mx_tr >= 0 else 0.0)
+                    # INTERACTIONS (dumping)
+                    + self.wi_dump_x_points * pts_table
+                    + self.wi_dump_x_pos * pos_in_trick
+                    + self.wi_dump_x_trumpcount * (tr_cnt / 10.0)
                 ),
             )
         )
