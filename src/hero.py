@@ -133,20 +133,155 @@ def _void_risk_for_lead(obs: dict, suit: int) -> float:
     return float(sum(1 for o in opps if void[o][suit]))
 
 
-@dataclass
-class HeroAgent:
-    """heuristic_v2: stronger heuristic policy (no search, no cheating).
+def _build_determinized_env_from_obs(obs: dict, rng, *, max_tries: int = 80) -> MaraffaEnv:
+    """Create a full env consistent with obs by sampling hidden opponent hands.
 
-    Adds public-information features in a way that can be tuned automatically:
-    - void suits inference
-    - suit safety from seen cards
-    - lead risk model (void opponents => higher cut risk)
-    - optional trump-draw heuristic when opponents are likely to cut
+    Constraints enforced:
+    - current player's hand is fixed to obs['hand_mask']
+    - cards in played_mask + current trick are removed from the deck
+    - void suits inferred from public history are respected (no cards of that suit)
 
-    NOTE: no teammate information sharing; the agent only uses its own hand + public history.
+    This is used only internally for lightweight Monte Carlo (not exposed to agents).
     """
 
-    name: str = "heuristic_v2"
+    me = int(obs["player"])
+    my_hand = int(obs["hand_mask"])
+
+    # Build void constraints.
+    void = _public_void_suits(obs)
+
+    # Cards already out of the game (played + current trick) and my hand.
+    unavailable = int(obs["played_mask"]) | int(my_hand)
+    for c in list(obs["trick_cards"]):
+        c = int(c)
+        if c >= 0:
+            unavailable |= 1 << c
+
+    remaining = [c for c in range(40) if ((unavailable >> c) & 1) == 0]
+
+    # Remaining hand sizes for others.
+    trick_index = int(obs["trick_index"])
+    trick_players = list(obs["trick_players"])
+    trick_len = int(obs["trick_len"])
+
+    def played_by(p: int) -> int:
+        # completed tricks + already played in current trick
+        in_cur = 1 if p in [int(x) for x in trick_players[:trick_len]] else 0
+        return trick_index + in_cur
+
+    need = [0, 0, 0, 0]
+    for p in range(4):
+        if p == me:
+            continue
+        need[p] = 10 - played_by(p)
+
+    # Prepare suit pools.
+    by_suit = [[], [], [], []]
+    for c in remaining:
+        by_suit[CARD_SUIT[c]].append(c)
+
+    for _ in range(max_tries):
+        pools = [lst[:] for lst in by_suit]
+        for s in range(4):
+            rng.shuffle(pools[s])
+
+        hands = [0, 0, 0, 0]
+        hands[me] = my_hand
+
+        # Deal to others; void constraints applied.
+        ok = True
+        for p in range(4):
+            if p == me:
+                continue
+            m = 0
+            for _k in range(need[p]):
+                allowed = [s for s in range(4) if (not void[p][s]) and pools[s]]
+                if not allowed:
+                    ok = False
+                    break
+                s = max(allowed, key=lambda ss: len(pools[ss]))
+                c = pools[s].pop()
+                m |= 1 << c
+            if not ok:
+                break
+            hands[p] = m
+
+        if not ok:
+            continue
+
+        env = MaraffaEnv(seed=0)
+        env.hands = [int(x) for x in hands]
+        env.current_player = int(obs["current_player"])
+        env.declarer = int(obs["declarer"])
+        env.choose_trump_phase = bool(obs["choose_trump_phase"])
+        env.trump_suit = int(obs["trump_suit"])
+        env.trick_cards = [int(x) for x in list(obs["trick_cards"])]
+        env.trick_players = [int(x) for x in list(obs["trick_players"])]
+        env.trick_len = int(obs["trick_len"])
+        env.lead_suit = int(obs["lead_suit"])
+        env.trick_index = int(obs["trick_index"])
+        st = list(obs["scores_thirds"])
+        env.scores_thirds = [int(st[0]), int(st[1])]
+        env.bonus_team = int(obs["bonus_team"])
+        env.played_mask = int(obs["played_mask"])
+        env.trick_history = obs.get("trick_history", [])[:]
+        env.done = bool(obs["done"])
+        return env
+
+    # Fallback: ignore voids.
+    rng.shuffle(remaining)
+    hands = [0, 0, 0, 0]
+    hands[me] = my_hand
+    idx = 0
+    for p in range(4):
+        if p == me:
+            continue
+        m = 0
+        for _k in range(need[p]):
+            c = remaining[idx]
+            idx += 1
+            m |= 1 << c
+        hands[p] = m
+
+    env = MaraffaEnv(seed=0)
+    env.hands = [int(x) for x in hands]
+    env.current_player = int(obs["current_player"])
+    env.declarer = int(obs["declarer"])
+    env.choose_trump_phase = bool(obs["choose_trump_phase"])
+    env.trump_suit = int(obs["trump_suit"])
+    env.trick_cards = [int(x) for x in list(obs["trick_cards"])]
+    env.trick_players = [int(x) for x in list(obs["trick_players"])]
+    env.trick_len = int(obs["trick_len"])
+    env.lead_suit = int(obs["lead_suit"])
+    env.trick_index = int(obs["trick_index"])
+    st = list(obs["scores_thirds"])
+    env.scores_thirds = [int(st[0]), int(st[1])]
+    env.bonus_team = int(obs["bonus_team"])
+    env.played_mask = int(obs["played_mask"])
+    env.trick_history = obs.get("trick_history", [])[:]
+    env.done = bool(obs["done"])
+    return env
+
+
+@dataclass
+class HeroAgent:
+    """heuristic_v3_hybrid: heuristic + small Monte Carlo on critical moves.
+
+    Still no cheating:
+    - uses only own hand + public info
+    - no teammate info sharing
+
+    On some decisions (especially when following and points are on table), it
+    samples plausible hidden hands and evaluates candidate actions by short
+    rollouts with heuristic_v0.
+    """
+
+    name: str = "heuristic_v3_hybrid"
+
+    # --- Monte Carlo settings (keep small: VPS-friendly)
+    mc_enabled: bool = True
+    mc_samples: int = 6
+    mc_rollout_tricks: int = 1  # finish current trick; 2 => also next trick
 
     # --- Trump choice weights
     w_cnt: float = 1.20
@@ -220,10 +355,8 @@ class HeroAgent:
                 best_s = int(s)
         return int(best_s)
 
-    def play_card(self, obs: dict, legal: list[int]) -> int:
-        if len(legal) == 1:
-            return int(legal[0])
-
+    def _heuristic_play_card(self, obs: dict, legal: list[int]) -> int:
+        """Pure heuristic (no MC) decision."""
         me = int(obs["player"])
         trump = int(obs["trump_suit"])
         trick_len = int(obs["trick_len"])
@@ -234,7 +367,6 @@ class HeroAgent:
             hand = int(obs["hand_mask"])
             endg = 1.0 if trick_index >= 7 else 0.0
 
-            # If opponents are frequently void in many suits, consider drawing trump.
             void = _public_void_suits(obs)
             opps = [(me + 1) & 3, (me + 3) & 3]
             opp_void_total = 0
@@ -242,7 +374,6 @@ class HeroAgent:
                 opp_void_total += sum(1 for s in range(4) if void[o][s])
             have_trump = (hand & SUIT_MASKS[trump]) != 0
 
-            # Candidate scoring.
             best = int(legal[0])
             best_sc = -1e18
             for c in legal:
@@ -259,13 +390,9 @@ class HeroAgent:
                 sc -= self.w_lead_trump_penalty * tr * (1.0 - endg)
                 sc += self.w_lead_suit_len * (suit_cnt / 10.0)
                 sc += self.w_lead_seen_high * seen_high
-
-                # Prefer suits that are "safer" and less likely to get cut.
                 sc -= self.w_lead_void_risk * void_risk * (1.0 - endg)
-                # If many cards of this suit already seen, it is slightly safer to lead it.
                 sc += self.w_lead_suit_seen * (seen_cnt / 10.0)
 
-                # Optional draw-trump impulse.
                 if have_trump and tr > 0.0:
                     sc += self.w_lead_draw_trump * (opp_void_total / 8.0) * (1.0 - endg)
 
@@ -288,7 +415,6 @@ class HeroAgent:
         winners = [c for c in legal if _wins_if_played(obs, me, c)]
 
         if partner_winning:
-            # If partner is winning, dump low value; only take if large points at risk.
             if winners and points_on_table >= 1.5:
                 return int(
                     min(
@@ -312,7 +438,6 @@ class HeroAgent:
             )
 
         if winners:
-            # Take with the cheapest winning card, but prioritize capturing points.
             return int(
                 min(
                     winners,
@@ -325,7 +450,6 @@ class HeroAgent:
                 )
             )
 
-        # Cannot win: dump low.
         return int(
             min(
                 legal,
@@ -336,3 +460,71 @@ class HeroAgent:
                 ),
             )
         )
+
+    def play_card(self, obs: dict, legal: list[int]) -> int:
+        if len(legal) == 1:
+            return int(legal[0])
+
+        # Decide whether to run MC.
+        if not self.mc_enabled:
+            return int(self._heuristic_play_card(obs, legal))
+
+        trick_len = int(obs["trick_len"])
+        # MC only when following (harder decision) or when there are points on table.
+        points_on_table = 0.0
+        if trick_len > 0:
+            cards = list(obs["trick_cards"])
+            for i in range(trick_len):
+                c = int(cards[i])
+                if c >= 0:
+                    points_on_table += CARD_POINTS_THIRDS[c] / 3.0
+
+        do_mc = (trick_len > 0 and (points_on_table >= 1.0 or len(legal) >= 3))
+        if not do_mc:
+            return int(self._heuristic_play_card(obs, legal))
+
+        import random
+        from .agent import Agent as HeuristicV0
+
+        rng = random.Random((int(obs["played_mask"]) ^ (int(obs["hand_mask"]) << 1) ^ 0xA11CE) & 0xFFFFFFFF)
+        v0 = HeuristicV0()
+
+        me = int(obs["player"])
+        my_team = team_of(me)
+
+        best_a = int(legal[0])
+        best_v = -1e18
+
+        for a in legal:
+            acc = 0.0
+            for _ in range(int(self.mc_samples)):
+                env = _build_determinized_env_from_obs(obs, rng)
+                base = (env.scores_thirds[my_team] - env.scores_thirds[1 - my_team]) / 3.0
+
+                env.step(int(a))
+
+                # Rollout: finish current trick and optionally next trick.
+                start_trick = env.trick_index
+                target_trick = start_trick + int(self.mc_rollout_tricks)
+                while not env.done and env.trick_index < target_trick:
+                    p = env.current_player
+                    legal2 = env.legal_actions(p)
+                    if not legal2:
+                        env.done = True
+                        break
+                    obs2 = env.obs(player=p)
+                    if env.choose_trump_phase:
+                        act2 = v0.choose_trump(obs2, legal2)
+                    else:
+                        act2 = v0.play_card(obs2, legal2)
+                    env.step(int(act2))
+
+                val = (env.scores_thirds[my_team] - env.scores_thirds[1 - my_team]) / 3.0 - base
+                acc += val
+
+            v = acc / float(self.mc_samples)
+            if v > best_v:
+                best_v = v
+                best_a = int(a)
+
+        return int(best_a)
